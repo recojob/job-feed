@@ -1,0 +1,67 @@
+name: mirror
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch feed
+        run: |
+          curl -sf --retry 3 --max-time 120 \
+            https://jobs.reco.sh/v0/job.json -o jobs.new.json
+
+      - name: Validate feed
+        run: |
+          python3 - <<'PY'
+          import json, sys, os
+
+          raw = json.load(open("jobs.new.json", encoding="utf-8"))
+
+          # The raw feed may be a bare list, or a dict containing the items list.
+          if isinstance(raw, list):
+              items = raw
+          elif isinstance(raw, dict):
+              items = next((v for v in raw.values() if isinstance(v, list)), None)
+              if items is None:
+                  sys.exit("No array found in feed dict")
+          else:
+              sys.exit("Unexpected top-level JSON type: %s" % type(raw).__name__)
+
+          count = len(items)
+          if count < 50:
+              # Never overwrite good data with a broken feed.
+              sys.exit("Refusing to mirror: only %d items (<50)" % count)
+
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("ITEM_COUNT=%d\n" % count)
+          print("Validated %d items" % count)
+          PY
+
+      - name: Promote and commit if the feed changed
+        run: |
+          mv -f jobs.new.json jobs.json
+          git add jobs.json
+          if git diff --cached --quiet -- jobs.json; then
+            echo "Feed unchanged — nothing to mirror."
+            exit 0
+          fi
+
+          # Feed changed: stamp meta.json and commit both.
+          printf '{"mirrored_at": "%s", "items": %s}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ITEM_COUNT" > meta.json
+
+          git config user.name  "reco-mirror-bot"
+          git config user.email "reco-mirror-bot@users.noreply.github.com"
+          git add jobs.json meta.json
+          git commit -m "Mirror job feed ($ITEM_COUNT items)"
+          git push
